@@ -9,6 +9,7 @@ import os
 import cv2
 import numpy as np
 import glob
+from pathlib import Path  # added
 
 # Try to import OCR library for text recognition
 try:
@@ -18,17 +19,63 @@ except ImportError:
     OCR_AVAILABLE = False
     print("Warning: easyocr not installed. Install with 'pip install easyocr' for text recognition.")
 
+# New: optional torch import to decide GPU/CPU automatically
+try:
+    import torch
+    _TORCH_AVAILABLE = True
+except Exception:
+    _TORCH_AVAILABLE = False
+
+# New: device resolver and torch summary
+def _resolve_device(dev_arg: str) -> str:
+    if dev_arg:
+        if dev_arg == '0':
+            desired = 'cuda:0'
+        elif dev_arg.lower() in ('cuda', 'gpu'):
+            desired = 'cuda:0'
+        else:
+            desired = dev_arg
+        if desired.startswith('cuda'):
+            if _TORCH_AVAILABLE and torch.cuda.is_available():
+                return desired
+            print("Warning: CUDA requested but not available in PyTorch. Falling back to CPU.")
+            return 'cpu'
+        return desired
+    if _TORCH_AVAILABLE and torch.cuda.is_available():
+        return 'cuda:0'
+    return 'cpu'
+
+def _print_torch_info():
+    if not _TORCH_AVAILABLE:
+        print("PyTorch not installed; running on CPU.")
+        return
+    try:
+        print(f"PyTorch: {torch.__version__} | CUDA available: {torch.cuda.is_available()} | CUDA build: {getattr(torch.version, 'cuda', None)}")
+        if torch.cuda.is_available():
+            print(f"GPU(s): {torch.cuda.device_count()} | Device 0: {torch.cuda.get_device_name(0)}")
+    except Exception:
+        pass
+
 def parse_args():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--weights", type=str, default="./best.pt", help="path to model weights (YOLOv8 .pt)")
+    parser.add_argument("--weights", type=str, default="runs/license_plate_detection/weights/last.pt", help="path to model weights (YOLOv8 .pt)")  # changed default
     parser.add_argument("--source", default=0, help="camera index, video file path, or 'valid' for validation dataset")
     parser.add_argument("--conf", type=float, default=0.25, help="confidence threshold")
     parser.add_argument("--save-crops", action="store_true", help="save cropped detections")
     parser.add_argument("--save-dir", type=str, default="./crops", help="directory to save crops")
     parser.add_argument("--imgsz", type=int, default=640, help="inference image size")
     parser.add_argument("--ocr", action="store_true", help="enable OCR text recognition")
+    parser.add_argument("--no-ocr", action="store_true", help="disable OCR text recognition")  # new
+    parser.add_argument("--ocr-gpu", action="store_true", help="use GPU for OCR if available")  # new
     parser.add_argument("--use-pretrained", action="store_true", help="use pre-trained YOLOv8 model if custom weights not found")
-    return parser.parse_args()
+    # New: allow explicit device selection (e.g. --device cuda:0 or --device cpu)
+    parser.add_argument("--device", type=str, default="", help="force device for inference, e.g. 'cuda:0' or 'cpu' (auto if empty)")
+    # Enable OCR by default; --no-ocr can disable it
+    parser.set_defaults(ocr=True)  # new
+    args = parser.parse_args()     # changed
+    if getattr(args, "no_ocr", False):  # new
+        args.ocr = False
+    return args
 
 def load_model(weights, use_pretrained=False):
     try:
@@ -36,46 +83,51 @@ def load_model(weights, use_pretrained=False):
     except Exception as e:
         raise RuntimeError("ultralytics package not found. Install via `pip install ultralytics`") from e
 
-    # Check if custom weights exist
-    if os.path.exists(weights):
+    # 0) If explicit weights path exists -> load it
+    if weights and os.path.exists(weights):
         print(f"Loading custom model: {weights}")
-        model = YOLO(weights)
-        return model
+        return YOLO(weights)
 
-    # If custom weights don't exist, try to find any .pt files in directory
+    # 1) Prefer the project default path: runs/license_plate_detection/weights/{last,best}.pt
+    runs_last = Path("runs") / "license_plate_detection" / "weights" / "last.pt"
+    runs_best = Path("runs") / "license_plate_detection" / "weights" / "best.pt"
+    if runs_last.exists():
+        print(f"No explicit weights found. Using: {runs_last}")
+        return YOLO(str(runs_last))
+    if runs_best.exists():
+        print(f"No explicit weights found. Using: {runs_best}")
+        return YOLO(str(runs_best))
+
+    # 2) If custom weights don't exist, try to find any .pt files in directory
     pt_files = glob.glob("*.pt")
     if pt_files:
         weights_file = pt_files[0]
-        print(f"Custom weights not found. Using: {weights_file}")
-        model = YOLO(weights_file)
-        return model
+        print(f"No explicit/project weights found. Using available .pt: {weights_file}")
+        return YOLO(weights_file)
 
-    # If no custom weights found and use_pretrained is True, use pre-trained model
+    # 3) If no custom weights found and use_pretrained is True, use pre-trained model
     if use_pretrained:
         print("No custom weights found. Using pre-trained YOLOv8n model.")
         print("Note: This model is trained on COCO dataset and may not detect license plates accurately.")
-        print("For better results, train a custom model or use --use-pretrained flag.")
-        model = YOLO('yolov8n.pt')  # This will download if not present
-        return model
+        return YOLO('yolov8n.pt')
 
-    # If we get here, no model could be loaded
+    # 4) Nothing found -> error
     raise FileNotFoundError(f"""
 Model weights not found: {weights}
 
-Options to fix this:
-1. Train a model and save weights as 'best.pt'
-2. Download pre-trained weights and place in current directory
-3. Use --use-pretrained flag to use YOLOv8 COCO model (less accurate for license plates)
-4. Specify different weights path with --weights argument
-
-Available .pt files in directory: {pt_files if pt_files else 'None'}
+Searched:
+ - {weights if weights else '(none provided)'}
+ - runs/license_plate_detection/weights/last.pt
+ - runs/license_plate_detection/weights/best.pt
+ - any .pt files in current directory
 """)
 
-def initialize_ocr():
+# Update: allow OCR to use GPU when available
+def initialize_ocr(use_gpu: bool = False):
     """Initialize OCR reader if available"""
     if OCR_AVAILABLE:
         try:
-            reader = easyocr.Reader(['en'])
+            reader = easyocr.Reader(['en'], gpu=bool(use_gpu))
             return reader
         except Exception as e:
             print(f"OCR initialization failed: {e}")
@@ -175,15 +227,29 @@ def get_validation_images():
     return []
 
 def run_camera(args):
+    # New: pick device (defaults to CUDA if available)
+    _print_torch_info()
+    device_str = _resolve_device(args.device)
+    print(f"Using device for inference: {device_str}")
+
     model = load_model(args.weights, args.use_pretrained)
+
+    # Try to move model to device (Ultralytics supports .to on the wrapped model)
+    try:
+        model.to(device_str)
+    except Exception:
+        # Fallback: we'll pass device per-call
+        pass
+
     names = getattr(model, "names", {0: 'License_Plate'}) or {0: 'License_Plate'}
 
-    # Initialize OCR if requested
+    # Initialize OCR if enabled (default ON). Use GPU if --ocr-gpu or CUDA device selected.
     ocr_reader = None
     if args.ocr:
-        ocr_reader = initialize_ocr()
+        use_gpu_for_ocr = bool(args.ocr_gpu) or device_str.startswith('cuda')  # new
+        ocr_reader = initialize_ocr(use_gpu=use_gpu_for_ocr)                   # changed
         if ocr_reader:
-            print("OCR enabled - license plate text will be extracted")
+            print(f"OCR enabled - license plate text will be extracted (gpu={use_gpu_for_ocr})")
         else:
             print("OCR initialization failed - continuing without text recognition")
 
@@ -208,8 +274,8 @@ def run_camera(args):
 
             start = time.time()
 
-            # Run inference
-            results = model(frame, imgsz=args.imgsz, conf=args.conf, verbose=False)
+            # Run inference (pass device)
+            results = model(frame, imgsz=args.imgsz, conf=args.conf, device=device_str, verbose=False)
             res = results[0]
 
             # Extract detection data
@@ -325,8 +391,8 @@ def run_camera(args):
         frame_id += 1
         start = time.time()
 
-        # Run inference
-        results = model(frame, imgsz=args.imgsz, conf=args.conf, verbose=False)
+        # Run inference (pass device)
+        results = model(frame, imgsz=args.imgsz, conf=args.conf, device=device_str, verbose=False)
         res = results[0]
 
         # Extract detection data
