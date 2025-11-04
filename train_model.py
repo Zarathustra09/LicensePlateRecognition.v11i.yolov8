@@ -3,7 +3,7 @@ Train YOLOv8 model for license plate detection using the Roboflow dataset.
 This script will create the best.pt file needed for detection.
 
 Usage:
-    python train_model.py --epochs 30 --imgsz 640 --batch 16
+    python train_model.py --epochs 100 --imgsz 640 --batch 16
 """
 import argparse
 import os
@@ -51,14 +51,14 @@ def _print_torch_info():
 def parse_args():
     parser = argparse.ArgumentParser(description='Train YOLOv8 License Plate Detection Model')
     parser.add_argument('--data', type=str, default='data.yaml', help='path to data.yaml file')
-    parser.add_argument('--epochs', type=int, default=20, help='number of epochs to train')  # was 100
+    parser.add_argument('--epochs', type=int, default=100, help='number of epochs to train')  # was 100
     parser.add_argument('--imgsz', type=int, default=640, help='image size for training')
     parser.add_argument('--batch', type=int, default=16, help='batch size (adjust based on GPU memory)')
     parser.add_argument('--model', type=str, default='yolov8n.pt', help='pretrained model to start from')
     parser.add_argument('--name', type=str, default='license_plate_detection', help='experiment name')
     parser.add_argument('--device', type=str, default='', help='device to train on (0 for GPU, cpu for CPU)')
     parser.add_argument('--workers', type=int, default=8, help='number of dataloader workers')
-    parser.add_argument('--patience', type=int, default=5, help='early stopping patience')  # was 50
+    parser.add_argument('--patience', type=int, default=10, help='early stopping patience')  # was 50
     return parser.parse_args()
 
 def check_dataset_structure():
